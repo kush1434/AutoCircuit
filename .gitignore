@@ -1,0 +1,4 @@
+# Ignore API keys and Python build clutter
+.env
+__pycache__/
+*.py[cod]
