@@ -1,59 +1,152 @@
 import streamlit as st
 import google.generativeai as genai
+from response_backend import init_db, log_response, get_accuracy
 from dotenv import load_dotenv
+import streamlit.components.v1 as components
 import os
 
-# Load API key from .env file
+# set up the database if it doesn't exist yet
+init_db()
+
+# load API key from .env
 load_dotenv()
 
-# Gemini API key configuration
+# set up Gemini model
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-# Utilize optimal Gemini model
 MODEL_NAME = "models/gemini-2.0-flash-exp"
 
-# UI setup
+# Streamlit page config
 st.set_page_config(page_title="AutoCircuit")
-st.title("AutoCircuit")
 
-st.markdown("### Provide Circuit Requirements")
+# if we trigger scroll reset
+if st.session_state.get("scroll_to_top", False):
+    components.html(
+        "<script>window.scrollTo({ top: 0, behavior: 'smooth' });</script>",
+        height=0,
+    )
+    st.session_state.scroll_to_top = False
 
-# Initalize input fields for user
-num_inputs = st.selectbox("Number of Inputs", [2, 3, 4])
-behavior = st.text_input("Desired Behavior", placeholder="ex. parity checker, counter, etc.")
-sync = st.checkbox("Synchronous?")
+# Title and accuracy
+col1, col2 = st.columns([3, 2])
+with col1:
+    st.title("AutoCircuit")
+with col2:
+    current_accuracy = get_accuracy()
+    st.metric(label="Model Accuracy", value=f"{current_accuracy:.1f}%")
+    st.caption("Based on testing and user feedback")
 
-# Button to generate circuit
-if st.button("Generate Circuit"):
-    if not behavior:
-        st.warning("Please describe the desired behavior.")
-    else:
-        # Gemini prompt for professional circuit generation
-        prompt = f"""
-You are a digital logic design assistant.
+st.markdown("### Describe What Your Circuit Should Do")
 
-Given:
-- Number of inputs: {num_inputs}
-- Desired behavior: {behavior}
-- Synchronous: {'Yes' if sync else 'No'}
+# set up session state
+if "response_text" not in st.session_state:
+    st.session_state.response_text = ""
+if "show_reprompt" not in st.session_state:
+    st.session_state.show_reprompt = False
 
-Please provide:
-1. Whether the circuit is combinational or sequential.
-2. A brief explanation (1–2 lines max).
-3. The logic expression or HDL-style pseudocode.
-4. A minimal truth table.
-5. An ASCII diagram.
+# main input form
+with st.form(key="main_form", clear_on_submit=False):
+    num_inputs = st.selectbox("Number of Inputs", [2, 3, 4])
+    behavior = st.text_area("What should the circuit do?", placeholder="e.g. even parity checker, 3-bit counter, etc.")
+    sync = st.checkbox("Is it synchronous?")
+    submitted = st.form_submit_button("Generate Circuit")
 
-Keep the output concise, professional, and free of unnecessary commentary.
+    if submitted:
+        if not behavior:
+            st.warning("You need to describe the circuit behavior.")
+        else:
+            prompt = f"""
+You're a logic design helper.
+
+Here's what the user wants:
+- Inputs: {num_inputs}
+- Behavior: {behavior}
+- Is it synchronous? {'Yes' if sync else 'No'}
+
+Give back:
+1. Is it combinational or sequential?
+2. A short explanation (1–2 lines tops).
+3. The logic formula or pseudocode.
+4. A simple truth table.
+5. A quick ASCII diagram.
+
+Keep it clean and to the point.
 """
+            try:
+                model = genai.GenerativeModel(MODEL_NAME)
+                response = model.generate_content(prompt)
+                st.session_state.response_text = response.text
+                st.session_state.show_reprompt = False
+            except Exception as e:
+                st.error(f"Couldn’t generate the circuit. Error: {e}")
 
-        try:
-            model = genai.GenerativeModel(MODEL_NAME)
-            response = model.generate_content(prompt)
-            
-            # Display Gemini's response
-            st.markdown("### Circuit Description")
-            st.markdown(response.text)
+# show the output if we have one
+if st.session_state.response_text:
+    st.markdown("### Generated Output")
+    st.markdown(st.session_state.response_text)
 
-        except Exception as e:
-            st.error(f"Could Not Generate Circuit. Error: {e}")
+    st.markdown("### How’d it do?")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("Looks Good"):
+            st.success("Thanks for the feedback!")
+            log_response(num_inputs, behavior, sync, st.session_state.response_text, 1)
+    with col2:
+        if st.button("Needs Fixing"):
+            st.session_state.show_reprompt = True
+            log_response(num_inputs, behavior, sync, st.session_state.response_text, 0)
+
+# show reprompt form if needed
+if st.session_state.show_reprompt:
+    st.markdown("### What should we change?")
+
+    if "feedback_confirmed" not in st.session_state:
+        st.session_state.feedback_confirmed = False
+
+    if not st.session_state.feedback_confirmed:
+        with st.form(key="fix_form", clear_on_submit=False):
+            user_fix = st.text_area(
+                "Tell us what was off or what needs to be fixed.",
+                key="custom_prompt"
+            )
+            confirm_submitted = st.form_submit_button("Confirm Feedback")
+
+            if confirm_submitted:
+                fix_prompt = f'''
+The following circuit was generated by a digital logic assistant:
+
+---
+{st.session_state.response_text}
+---
+
+The user wants to improve or correct the output. Their feedback:
+"""{user_fix}"""
+
+Please regenerate the output in the **exact same structure** as before:
+1. Is it combinational or sequential?
+2. A short explanation (1–2 lines tops).
+3. The logic formula or pseudocode.
+4. A simple truth table.
+5. A quick ASCII diagram.
+
+Keep it clean and on point.
+'''
+                try:
+                    model = genai.GenerativeModel(MODEL_NAME)
+                    new_response = model.generate_content(fix_prompt)
+                    st.session_state.new_response_text = new_response.text
+                    st.session_state.feedback_confirmed = True
+                    st.success("Got it. Click the button to see the new version.")
+                except Exception as e:
+                    st.error(f"Couldn’t regenerate the circuit. Error: {e}")
+                    st.session_state.feedback_confirmed = False
+
+    # show updated output if confirmed
+    if st.session_state.feedback_confirmed:
+        if st.button("Show Updated Output"):
+            st.session_state.response_text = st.session_state.new_response_text
+            st.session_state.show_reprompt = False
+            st.session_state.feedback_confirmed = False
+            del st.session_state["new_response_text"]
+            st.session_state.scroll_to_top = True
+            st.rerun()
